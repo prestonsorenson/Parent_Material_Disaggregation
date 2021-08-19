@@ -1,0 +1,594 @@
+library(raster)
+library(ranger)
+library(rgdal)
+library(caret)
+library(clhs)
+library(tidyr)
+
+################build models####################
+setwd('/home/preston/OneDrive/Papers/Parent_Material_PSM/Data')
+#import DSMART Points
+psm_train=read.csv('DSMART_generated_training_points_wRasterVals_11Jul2021.csv', stringsAsFactors = FALSE)
+
+#relabel parent materials
+#https://sis.agr.gc.ca/cansis/nsdb/soil/v2/snt/mdep1.html
+#drop GLFL and GLLC as very few and probably in LACU and FLUV categories
+psm_train=psm_train[!(psm_train$MDEP1 %in% c("GLFL", 'GLLC', 'UNDM')),]
+table(psm_train$MDEP1)
+
+psm_train$MDEP2[psm_train$MDEP2!='TILL'] <- NA
+
+#create a less precise category
+psm_train$mdep=psm_train$MDEP1
+psm_train$mdep[psm_train$mdep=='FLEO'] <- 'FLUV'
+psm_train$mdep[psm_train$mdep=='FLLC'] <- 'FLUV'
+psm_train$mdep[psm_train$mdep=='FNPT'] <- 'PEAT'
+psm_train$mdep[psm_train$mdep=='SPPT'] <- 'PEAT'
+psm_train$mdep[psm_train$mdep=='LATL'] <- 'LACU'
+psm_train$mdep[psm_train$mdep=='RESD'] <- 'BEDR'
+psm_train$mdep[psm_train$mdep=='RKUD'] <- 'BEDR'
+
+table(psm_train$mdep)
+
+psm_train$mdep=paste(psm_train$mdep, psm_train$MDEP2, sep="_")
+
+table(psm_train$mdep)
+
+#psm_train=psm_train[psm_train$mdep %in% (c("BEDR_NA", "COLL_NA","EOLI_NA","EOLI_TILL","FLUV_NA","FLUV_TILL","LACU_NA","LACU_TILL","PEAT_NA", "TILL_NA","TILL_TILL","UNDM_NA","UNDM_TILL")),]
+
+psm_train$mdep[psm_train$mdep == 'BEDR_NA'] <- "BEDR"
+psm_train$mdep[psm_train$mdep == 'COLL_NA'] <- "COLL"
+psm_train$mdep[psm_train$mdep == 'COLL_TILL'] <- "COLL"
+psm_train$mdep[psm_train$mdep == 'EOLI_NA'] <- "EOLI"
+psm_train$mdep[psm_train$mdep == 'EOLI_TILL'] <- "EOLI"
+psm_train$mdep[psm_train$mdep == 'FLUV_NA'] <- "FLUV"
+psm_train$mdep[psm_train$mdep == 'FLUV_TILL'] <- "FLUV"
+psm_train$mdep[psm_train$mdep == 'LACU_NA'] <- "LACU"
+psm_train$mdep[psm_train$mdep == 'PEAT_NA'] <- "PEAT"
+psm_train$mdep[psm_train$mdep == 'PEAT_TILL'] <- "PEAT"
+psm_train$mdep[psm_train$mdep == 'TILL_NA'] <- "TILL"
+psm_train$mdep[psm_train$mdep == 'TILL_TILL'] <- "TILL"
+psm_train$mdep[psm_train$mdep == 'UNDM_NA'] <- "UNDM"
+psm_train$mdep[psm_train$mdep == 'UNDM_TILL'] <- "UNDM"
+
+table(psm_train$mdep)
+
+#plot values
+#boxplot(psm_train$alos_9x9_sd101x101~psm_train$mdep, ylim=c(0,50))
+#quantile(psm_train$alos_9x9_sd101x101, probs=seq(0,1,0.2), na.rm=TRUE)
+
+#remove na values and areas without bare soils
+psm_train=psm_train[,-c(1:8)]
+psm_train=na.omit(psm_train)
+colnames(psm_train)
+
+psm_train_noBS=psm_train
+
+#the following line sets whether to include points without bare soil composite imagery values
+#Do not run this line if you want to keep the points without bare soil imagery
+psm_train=psm_train[psm_train$b5!=0,]
+
+#create training data where bare soil is not included
+psm_train_noBS=psm_train_noBS[,-c(20:26)]
+
+table(psm_train$mdep)
+table(psm_train_noBS$mdep)
+
+#subsample by group
+psm_train_pca=prcomp(psm_train[,-29])
+psm_train_noBS_pca=prcomp(psm_train_noBS[,-22])
+
+train=clhs(data.frame(psm_train_pca$x[,1:2]), size=1000000, iter=100)
+psm_train=psm_train[train,]
+
+train_noBS=clhs(data.frame(psm_train_noBS_pca$x[,1:2]), size=1000000, iter=100)
+psm_train_noBS=psm_train_noBS[train_noBS,]
+
+rm(psm_train_pca)
+rm(psm_train_noBS_pca)
+
+table(psm_train$mdep)
+table(psm_train_noBS$mdep)
+
+
+#balance case weights
+w <- 1/table(psm_train$mdep)
+w <- w/sum(w)
+weights <- rep(0, nrow(psm_train))
+for (i in 1:length(w)){
+  temp_label=names(w)[i]
+  weights[psm_train$mdep==temp_label] <- w[i]
+}
+
+#no BS
+w <- 1/table(psm_train_noBS$mdep)
+w <- w/sum(w)
+weights_noBS <- rep(0, nrow(psm_train_noBS))
+for (i in 1:length(w)){
+  temp_label=names(w)[i]
+  weights_noBS[psm_train_noBS$mdep==temp_label] <- w[i]
+}
+
+
+#bare soil model
+#variable selection
+model_pm=ranger(mdep~., data=psm_train, importance='impurity',probability=TRUE, splitrule = "extratrees", case.weights = weights)
+model_pm
+sort(importance(model_pm), decreasing=TRUE)
+
+#forward feature selection
+bare_soil_var=names(sort(importance(model_pm), decreasing=TRUE))
+bare_soil_var=c('mdep', bare_soil_var)
+val=vector('list')
+for (i in 2:length(bare_soil_var)){
+  temp=psm_train[,bare_soil_var[1:i]]
+  model=ranger(mdep~., data=temp, importance='impurity',probability=TRUE, splitrule = "extratrees", case.weights = weights)
+  val=c(val, model$prediction.error)
+  rm(model)
+}
+val_bs=unlist(val)
+val_bs=data.frame(bare_soil_var[-1], val_bs)
+a=1:nrow(val_bs)
+plot(val_bs$val_bs~a)
+val_bs
+which.min(val_bs$val_bs)
+
+#final model
+val_bs_final=as.character(val_bs$bare_soil_var..1.[1:which.min(val_bs$val_bs)])
+val_bs_final=c('mdep', val_bs_final)
+psm_train_final=psm_train[,val_bs_final]
+#psm_train_final=psm_train_final[,-14]
+
+
+model_pm=ranger(mdep~., data=psm_train_final, importance='impurity', probability=TRUE, splitrule = "extratrees", case.weights = weights)
+model_pm
+
+#no bare soil
+#forward feature selection
+model_pm_noBS=ranger(mdep~., data=psm_train_noBS, importance='impurity',probability=TRUE, splitrule = "extratrees", case.weights = weights)
+model_pm_noBS
+sort(importance(model_pm_noBS), decreasing=TRUE)
+
+no_bare_soil_var=names(sort(importance(model_pm_noBS), decreasing=TRUE))
+no_bare_soil_var=c('mdep', no_bare_soil_var)
+val=vector('list')
+for (i in 2:length(bare_soil_var)){
+  temp=psm_train_noBS[,no_bare_soil_var[1:i]]
+  model=ranger(mdep~., data=temp, importance='impurity',probability=TRUE, splitrule = "extratrees", case.weights = weights)
+  val=c(val, model$prediction.error)
+  rm(model)
+}
+val_no_bs=unlist(val)
+val_no_bs=data.frame(no_bare_soil_var[-1], val_no_bs)
+a=1:nrow(val_no_bs)
+plot(val$val_no_bs~a)
+val_no_bs
+which.min(val_no_bs$val_no_bs)
+
+
+#final model
+val_no_bs_final=as.character(val_no_bs$no_bare_soil_var..1.[1:which.min(val_no_bs$val_no_bs)])
+val_no_bs_final=c('mdep', val_no_bs_final)
+psm_train_noBS_final=psm_train_noBS[,val_no_bs_final]
+
+model_pm_noBS=ranger(mdep~., data=psm_train_noBS_final, importance='impurity', probability=TRUE, splitrule = "extratrees", case.weights = weights)
+model_pm_noBS
+
+#validation
+#validation data
+pm_test=read.csv('saskatchewan_pedons_pm_raster_vals_10Jul2021.csv', stringsAsFactors = FALSE)
+pm_test=pm_test[!(pm_test$MDEP1 %in% c("GLFL", 'GLLC')),]
+table(pm_test$MDEP1)
+
+pm_test$MDEP2[pm_test$MDEP2!='TILL'] <- NA
+
+#create a less precise category
+pm_test$mdep=pm_test$MDEP1
+pm_test$mdep[pm_test$mdep=='FLEO'] <- 'FLUV'
+pm_test$mdep[pm_test$mdep=='FLLC'] <- 'FLUV'
+pm_test$mdep[pm_test$mdep=='FNPT'] <- 'PEAT'
+pm_test$mdep[pm_test$mdep=='SPPT'] <- 'PEAT'
+pm_test$mdep[pm_test$mdep=='LATL'] <- 'LACU'
+pm_test$mdep[pm_test$mdep=='RESD'] <- 'BEDR'
+pm_test$mdep[pm_test$mdep=='RKUD'] <- 'BEDR'
+
+table(pm_test$mdep)
+
+pm_test$mdep=paste(pm_test$mdep, pm_test$MDEP2, sep="_")
+
+table(pm_test$mdep)
+
+pm_test$mdep[pm_test$mdep == 'BEDR_NA'] <- "BEDR"
+pm_test$mdep[pm_test$mdep == 'COLL_NA'] <- "COLL"
+pm_test$mdep[pm_test$mdep == 'COLL_TILL'] <- "COLL"
+pm_test$mdep[pm_test$mdep == 'EOLI_NA'] <- "EOLI"
+pm_test$mdep[pm_test$mdep == 'EOLI_TILL'] <- "EOLI"
+pm_test$mdep[pm_test$mdep == 'FLUV_NA'] <- "FLUV"
+pm_test$mdep[pm_test$mdep == 'FLUV_TILL'] <- "FLUV"
+pm_test$mdep[pm_test$mdep == 'LACU_NA'] <- "LACU"
+pm_test$mdep[pm_test$mdep == 'PEAT_NA'] <- "PEAT"
+pm_test$mdep[pm_test$mdep == 'PEAT_TILL'] <- "PEAT"
+pm_test$mdep[pm_test$mdep == 'TILL_NA'] <- "TILL"
+pm_test$mdep[pm_test$mdep == 'TILL_TILL'] <- "TILL"
+pm_test$mdep[pm_test$mdep == 'UNDM_NA'] <- "UNDM"
+pm_test$mdep[pm_test$mdep == 'UNDM_TILL'] <- "UNDM"
+
+table(pm_test$mdep)
+
+pm_test=pm_test[,c(21:49)]
+pm_test=na.omit(pm_test)
+pm_test_noBS=pm_test
+pm_test=pm_test[pm_test$b5!=0,]
+
+table(pm_test$mdep)  
+table(pm_test_noBS$mdep)  
+
+#validation testing
+actual_noBS=as.factor(pm_test_noBS$mdep)
+actual=as.factor(pm_test$mdep)
+
+#bare soil
+pred=predict(model_pm, data=pm_test)
+pred=pred$predictions
+
+second_highest = colnames(pred)[apply(pred, 1, function(x)which(x != 0 & x == sort(x, decreasing = TRUE)[2])[1])]
+pred_prob=apply(pred, 1, function(x) sort(x, decreasing=TRUE)[1])
+pred_prob2=apply(pred, 1, function(x) sort(x, decreasing=TRUE)[2])
+pred=colnames(pred)[max.col(pred, ties.method="first")]
+pred=as.factor(pred)
+second_highest=as.factor(second_highest)
+
+pred=factor(pred, levels=union(levels(actual), levels(pred)))
+second_highest=factor(second_highest, levels=union(levels(actual), levels(second_highest)))
+
+confusionMatrix(actual, pred)
+confusionMatrix(actual, second_highest)
+
+
+#no bare soil
+pred_noBS=predict(model_pm_noBS, data=pm_test_noBS)
+pred_noBS=pred_noBS$predictions
+
+second_highest = colnames(pred_noBS)[apply(pred_noBS, 1, function(x)which(x != 0 & x == sort(x, decreasing = TRUE)[2])[1])]
+pred_noBS_prob=apply(pred_noBS, 1, function(x) sort(x, decreasing=TRUE)[1])
+pred_noBS_prob2=apply(pred_noBS, 1, function(x) sort(x, decreasing=TRUE)[2])
+pred_noBS=colnames(pred_noBS)[max.col(pred_noBS, ties.method="first")]
+pred_noBS=as.factor(pred_noBS)
+second_highest_noBS=as.factor(second_highest)
+
+pred_noBS=factor(pred_noBS, levels=union(levels(actual_noBS), levels(pred_noBS)))
+second_highest_noBS=factor(second_highest_noBS, levels=union(levels(actual_noBS), levels(second_highest_noBS)))
+
+confusionMatrix(actual_noBS, pred_noBS)
+confusionMatrix(actual_noBS, second_highest_noBS)
+
+##############Bare Soil Full Province Map###########################
+setwd('/home/preston/OneDrive/Papers/Parent_Material_PSM/Data')
+sen1=stack('/media/preston/My Book/Saskatchewan/sk_sen1_mosaic_30_9x9_sept_oct/sk_sen1_mosaic_30_9x9_sept_oct.vrt')
+bare_soil=stack('/media/preston/My Book/Saskatchewan/sk_bare_soil/sk_ls5_bare_soil_ndvi3_ndsi0_nbr1_focal10_filt/sk_ls5_bare_soil_ndsi_ndvi3_ndsi0_nbr1_focal10.tif')
+VH_9x9=sen1[[2]]
+alos_9x9_sd101x101=raster('/media/preston/My Book/Saskatchewan/sk_elevation_alos/sk_elevation_alos_9x9_sd101x101.tif')
+b5=bare_soil[[5]]
+ndvi_sd=raster('/media/preston/My Book/Saskatchewan/sk_l7_ndvi_sd_focal3/sk_l7_ndvi_sd_focal3.tif')
+ndvi_med_oct=raster('/media/preston/My Book/Saskatchewan/sk_l7_ndvi_median_oct_focal3/sk_l7_ndvi_median_oct_focal3.tif')
+ari=raster('/media/preston/My Book/Saskatchewan/sk_l7_ARI_median_focal3/sk_l7_ARI_median_focal3.tif')
+b7=bare_soil[[7]]
+b2=bare_soil[[2]]
+VV_9x9=sen1[[1]]
+ndvi_med_jul=raster('/media/preston/My Book/Saskatchewan/sk_l7_ndvi_median_july_focal3/sk_l7_ndvi_median_july_focal3.tif')
+reip=raster('/media/preston/My Book/Saskatchewan/sk_sen2_reip_med_focal9_july/sk_sen2_reip_med_focal9_july.tif')
+crsi=raster('/media/preston/My Book/Saskatchewan/sk_l7_CSRI_median_focal3/sk_l7_CSRI_median_focal3.tif')
+alos_3x3_sd21x21=raster('/media/preston/My Book/Saskatchewan/sk_elevation_alos/sk_elevation_alos_3x3_sd21x21.tif')
+sk_sen2=stack('/media/preston/My Book/Saskatchewan/sk_sen2_mosaic/sk_sen2_mosaic.vrt')
+
+#import tiles
+tiles=shapefile('saskatchewan_parent_material_prediction_grid.shp')
+
+#set factor levels
+pm_levels=as.factor(names(table(psm_train$mdep)))
+
+#Loop by tile
+setwd('/home/preston/OneDrive/Papers/Parent_Material_PSM/Analysis/2021_08_09/Province_Bare_Soil')
+
+#tiles for paper
+#117, 50, 180, 69, 124
+
+for (i in c(117, 50, 180, 69, 124)){
+#crop to roi
+roi=tiles[tiles$X==i,]
+VH_9x9_sub=crop(VH_9x9, roi)
+alos_9x9_sd101x101_sub=crop(alos_9x9_sd101x101, roi)
+b1_sub=crop(b1, roi)
+b2_sub=crop(b2, roi)
+b3_sub=crop(b3, roi)
+b4_sub=crop(b4, roi)
+b5_sub=crop(b5, roi)
+b7_sub=crop(b7, roi)
+ndvi_sd_sub=crop(ndvi_sd, roi)
+ndvi_med_oct_sub=crop(ndvi_med_oct, roi)
+ari_sub=crop(ari, roi)
+VV_9x9_sub=crop(VV_9x9, roi)
+ndvi_med_jul_sub=crop(ndvi_med_jul, roi)
+reip_sub=crop(reip, roi)
+crsi_sub=crop(crsi, roi)
+alos_3x3_sd21x21_sub=crop(alos_3x3_sd21x21, roi)
+alos_9x9_sd21x21_sub=crop(alos_9x9_sd21x21, roi)
+
+#resample bare soil 
+b1_sub=raster::resample(b1_sub, ndvi_sd_sub)
+b2_sub=raster::resample(b2_sub, ndvi_sd_sub)
+b3_sub=raster::resample(b3_sub, ndvi_sd_sub)
+b4_sub=raster::resample(b4_sub, ndvi_sd_sub)
+b5_sub=raster::resample(b5_sub, ndvi_sd_sub)
+b7_sub=raster::resample(b7_sub, ndvi_sd_sub)
+
+raster_inputs=stack(VH_9x9_sub, ari_sub, ndvi_sd_sub, b5_sub, alos_9x9_sd101x101_sub, b2_sub, ndvi_med_oct_sub, b7_sub, VV_9x9_sub, b3_sub, b1_sub, b4_sub, ndvi_med_jul_sub, crsi_sub, reip_sub, alos_3x3_sd21x21_sub)
+
+#convert to points
+raster_inputs=rasterToPoints(raster_inputs)
+
+xy=raster_inputs[,1:2]
+raster_inputs=raster_inputs[,-c(1:2)]
+colnames(raster_inputs)=colnames(psm_train_final)[-1]
+
+raster_inputs=replace_na(raster_inputs, 0)
+
+#create predictions, legend table, and raster
+pred_map=predict(model_pm, data=raster_inputs)
+pred_map=pred_map$predictions
+
+second_highest_map = colnames(pred_map)[apply(pred_map, 1, function(x)which(x != 0 & x == sort(x, decreasing = TRUE)[2])[1])]
+pred_map_prob=apply(pred_map, 1, function(x) sort(x, decreasing=TRUE)[1])
+pred_map_prob2=apply(pred_map, 1, function(x) sort(x, decreasing=TRUE)[2])
+pred_map=colnames(pred_map)[max.col(pred_map, ties.method="first")]
+pred_map=factor(pred_map, levels=pm_levels)
+second_highest_map=factor(second_highest_map, levels=pm_levels)
+
+#prediction confidence
+#1 - (pred_map_prob - pred_map_prob2)
+ci=1-(pred_map_prob-pred_map_prob2)
+
+#create rasters
+pred_map_counts=table(pred_map)
+second_highest_map_counts=table(second_highest_map)
+
+pred_map=data.frame(pred_map, xy)
+second_highest_map=data.frame(second_highest_map, xy)
+pred_map_prob=data.frame(pred_map_prob, xy)
+pred_map_prob2=data.frame(pred_map_prob2, xy)
+ci=data.frame(ci, xy)
+
+coordinates(pred_map)=~x+y
+coordinates(second_highest_map)=~x+y
+coordinates(pred_map_prob)=~x+y
+coordinates(pred_map_prob2)=~x+y
+coordinates(ci)=~x+y
+
+pred_map=rasterFromXYZ(pred_map)
+second_highest_map=rasterFromXYZ(second_highest_map)
+pred_map_prob=rasterFromXYZ(pred_map_prob)
+pred_map_prob2=rasterFromXYZ(pred_map_prob2)
+ci=rasterFromXYZ(ci)
+
+#mask null values for bare soil imagery
+pred_map=mask(pred_map, b5_sub, maskvalue=0)
+second_highest_map=mask(second_highest_map, b5_sub, maskvalue=0)
+
+crs(pred_map)=crs(b5)
+crs(second_highest_map)=crs(b5)
+crs(pred_map_prob)=crs(b5)
+crs(pred_map_prob2)=crs(b5)
+crs(ci)=crs(b5)
+
+raster_outputs=stack(pred_map, second_highest_map, pred_map_prob, pred_map_prob2, ci)
+names(raster_outputs)=c('Most_Likely', "Second_Likely", 'Probability_First', 'Probability_Second', 'Confidence_Interval')
+
+#export results
+writeRaster(raster_outputs, paste('parent_material_map_bare_soil_2021_08_05', i, '.tif', i, sep="_"), format="GTiff", overwrite=TRUE)
+}
+
+##############No Bare Soil Full Province Map###########################
+setwd('/home/preston/OneDrive/Papers/Parent_Material_PSM/Analysis/2021_08_04/Province_No_Bare_Soil')
+
+
+for (i in c(117, 50, 180, 69, 124)){
+  #crop to roi
+  roi=tiles[tiles$X==i,]
+  VH_9x9_sub=crop(VH_9x9, roi)
+  alos_9x9_sd101x101_sub=crop(alos_9x9_sd101x101, roi)
+  ndvi_sd_sub=crop(ndvi_sd, roi)
+  ndvi_med_oct_sub=crop(ndvi_med_oct, roi)
+  ari_sub=crop(ari, roi)
+  VV_9x9_sub=crop(VV_9x9, roi)
+  ndvi_med_jul_sub=crop(ndvi_med_jul, roi)
+  reip_sub=crop(reip, roi)
+  crsi_sub=crop(crsi, roi)
+  alos_3x3_sd21x21_sub=crop(alos_3x3_sd21x21, roi)
+  alos_9x9_sd21x21_sub=crop(alos_9x9_sd21x21, roi)
+  
+  #resample bare soil 
+  raster_inputs=stack(ndvi_sd_sub, ndvi_med_oct_sub, VH_9x9_sub, VV_9x9_sub, ari_sub, reip_sub, alos_9x9_sd101x101_sub, ndvi_med_jul_sub, crsi_sub, alos_9x9_sd21x21_sub, alos_3x3_sd21x21_sub)
+  
+  #convert to points
+  raster_inputs=rasterToPoints(raster_inputs)
+  
+  xy=raster_inputs[,1:2]
+  raster_inputs=raster_inputs[,-c(1:2)]
+  colnames(raster_inputs)=colnames(psm_train_noBS_final)[-1]
+  
+  raster_inputs=replace_na(raster_inputs, 0)
+  
+  #create predictions, legend table, and raster
+  pred_map=predict(model_pm_noBS, data=raster_inputs)
+  pred_map=pred_map$predictions
+  
+  second_highest_map = colnames(pred_map)[apply(pred_map, 1, function(x)which(x != 0 & x == sort(x, decreasing = TRUE)[2])[1])]
+  pred_map_prob=apply(pred_map, 1, function(x) sort(x, decreasing=TRUE)[1])
+  pred_map_prob2=apply(pred_map, 1, function(x) sort(x, decreasing=TRUE)[2])
+  pred_map=colnames(pred_map)[max.col(pred_map, ties.method="first")]
+  pred_map=factor(pred_map, levels=pm_levels)
+  second_highest_map=factor(second_highest_map, levels=pm_levels)
+  
+  #prediction confidence
+  #1 - (pred_map_prob - pred_map_prob2)
+  ci=1-(pred_map_prob-pred_map_prob2)
+  
+  #create rasters
+  pred_map_counts=table(pred_map)
+  second_highest_map_counts=table(second_highest_map)
+  
+  pred_map=data.frame(pred_map, xy)
+  second_highest_map=data.frame(second_highest_map, xy)
+  pred_map_prob=data.frame(pred_map_prob, xy)
+  pred_map_prob2=data.frame(pred_map_prob2, xy)
+  ci=data.frame(ci, xy)
+  
+  coordinates(pred_map)=~x+y
+  coordinates(second_highest_map)=~x+y
+  coordinates(pred_map_prob)=~x+y
+  coordinates(pred_map_prob2)=~x+y
+  coordinates(ci)=~x+y
+  
+  pred_map=rasterFromXYZ(pred_map)
+  second_highest_map=rasterFromXYZ(second_highest_map)
+  pred_map_prob=rasterFromXYZ(pred_map_prob)
+  pred_map_prob2=rasterFromXYZ(pred_map_prob2)
+  ci=rasterFromXYZ(ci)
+  
+  crs(pred_map)=crs(ndvi_sd_sub)
+  crs(second_highest_map)=crs(ndvi_sd_sub)
+  crs(pred_map_prob)=crs(ndvi_sd_sub)
+  crs(pred_map_prob2)=crs(ndvi_sd_sub)
+  crs(ci)=crs(ndvi_sd_sub)
+  
+  raster_outputs=stack(pred_map, second_highest_map, pred_map_prob, pred_map_prob2, ci)
+  names(raster_outputs)=c('Most_Likely', "Second_Likely", 'Probability_First', 'Probability_Second', 'Confidence_Interval')
+  
+  #export results
+  writeRaster(raster_outputs, paste('parent_material_map_no_bare_soil_2021_08_05', i, '.tif', i, sep="_"), format="GTiff", overwrite=TRUE)
+}
+
+##############Bare with Zeros Soil Full Province Map###########################
+setwd('/home/preston/OneDrive/Papers/Parent_Material_PSM/Data')
+sen1=stack('/media/preston/My Book/Saskatchewan/sk_sen1_mosaic_30_9x9_sept_oct/sk_sen1_mosaic_30_9x9_sept_oct.vrt')
+bare_soil=stack('/media/preston/My Book/Saskatchewan/sk_bare_soil/sk_ls5_bare_soil_ndvi3_ndsi0_nbr1_focal10_filt/sk_ls5_bare_soil_ndsi_ndvi3_ndsi0_nbr1_focal10.tif')
+VH_9x9=sen1[[2]]
+alos_9x9_sd101x101=raster('/media/preston/My Book/Saskatchewan/sk_elevation_alos/sk_elevation_alos_9x9_sd101x101.tif')
+b5=bare_soil[[5]]
+ndvi_sd=raster('/media/preston/My Book/Saskatchewan/sk_l7_ndvi_sd_focal3/sk_l7_ndvi_sd_focal3.tif')
+ndvi_med_oct=raster('/media/preston/My Book/Saskatchewan/sk_l7_ndvi_median_oct_focal3/sk_l7_ndvi_median_oct_focal3.tif')
+ari=raster('/media/preston/My Book/Saskatchewan/sk_l7_ARI_median_focal3/sk_l7_ARI_median_focal3.tif')
+b7=bare_soil[[7]]
+b2=bare_soil[[2]]
+b1=bare_soil[[1]]
+b3=bare_soil[[3]]
+b4=bare_soil[[4]]
+VV_9x9=sen1[[1]]
+ndvi_med_jul=raster('/media/preston/My Book/Saskatchewan/sk_l7_ndvi_median_july_focal3/sk_l7_ndvi_median_july_focal3.tif')
+reip=raster('/media/preston/My Book/Saskatchewan/sk_sen2_reip_med_focal9_july/sk_sen2_reip_med_focal9_july.tif')
+crsi=raster('/media/preston/My Book/Saskatchewan/sk_l7_CSRI_median_focal3/sk_l7_CSRI_median_focal3.tif')
+alos_3x3_sd21x21=raster('/media/preston/My Book/Saskatchewan/sk_elevation_alos/sk_elevation_alos_3x3_sd21x21.tif')
+sk_sen2=stack('/media/preston/My Book/Saskatchewan/sk_sen2_mosaic/sk_sen2_mosaic.vrt')
+alos_9x9_sd21x21=raster('/media/preston/My Book/Saskatchewan/sk_elevation_alos/sk_elevation_alos_9x9_sd21x21.tif')
+
+#import tiles
+tiles=shapefile('saskatchewan_parent_material_prediction_grid.shp')
+
+#set factor levels
+pm_levels=as.factor(names(table(psm_train$mdep)))
+
+#Loop by tile
+setwd('/home/preston/OneDrive/Papers/Parent_Material_PSM/Analysis/2021_08_09/Province_Bare_Soil')
+
+#tiles for paper
+#117, 50, 180, 69, 124
+
+for (i in c(117, 50, 180, 69, 124)){
+  #crop to roi
+  roi=tiles[tiles$X==i,]
+  VH_9x9_sub=crop(VH_9x9, roi)
+  alos_9x9_sd101x101_sub=crop(alos_9x9_sd101x101, roi)
+  b1_sub=crop(b1, roi)
+  b2_sub=crop(b2, roi)
+  b3_sub=crop(b3, roi)
+  b4_sub=crop(b4, roi)
+  b5_sub=crop(b5, roi)
+  b7_sub=crop(b7, roi)
+  ndvi_sd_sub=crop(ndvi_sd, roi)
+  ndvi_med_oct_sub=crop(ndvi_med_oct, roi)
+  ari_sub=crop(ari, roi)
+  VV_9x9_sub=crop(VV_9x9, roi)
+  ndvi_med_jul_sub=crop(ndvi_med_jul, roi)
+  reip_sub=crop(reip, roi)
+  crsi_sub=crop(crsi, roi)
+  alos_3x3_sd21x21_sub=crop(alos_3x3_sd21x21, roi)
+  alos_9x9_sd21x21_sub=crop(alos_9x9_sd21x21, roi)
+  
+  #resample bare soil 
+  b1_sub=raster::resample(b1_sub, ndvi_sd_sub)
+  b2_sub=raster::resample(b2_sub, ndvi_sd_sub)
+  b3_sub=raster::resample(b3_sub, ndvi_sd_sub)
+  b4_sub=raster::resample(b4_sub, ndvi_sd_sub)
+  b5_sub=raster::resample(b5_sub, ndvi_sd_sub)
+  b7_sub=raster::resample(b7_sub, ndvi_sd_sub)
+  
+  raster_inputs=stack(VH_9x9_sub, alos_9x9_sd101x101_sub, VV_9x9_sub, ari_sub, ndvi_sd_sub, ndvi_med_oct_sub, reip_sub, ndvi_med_jul_sub, b5_sub, b7_sub, alos_3x3_sd21x21_sub, alos_9x9_sd21x21_sub, crsi_sub, b4_sub, b1_sub)
+  
+  #convert to points
+  raster_inputs=rasterToPoints(raster_inputs)
+  
+  xy=raster_inputs[,1:2]
+  raster_inputs=raster_inputs[,-c(1:2)]
+  colnames(raster_inputs)=colnames(psm_train_final)[-1]
+  
+  raster_inputs=replace_na(raster_inputs, 0)
+  
+  #create predictions, legend table, and raster
+  pred_map=predict(model_pm, data=raster_inputs)
+  pred_map=pred_map$predictions
+  
+  second_highest_map = colnames(pred_map)[apply(pred_map, 1, function(x)which(x != 0 & x == sort(x, decreasing = TRUE)[2])[1])]
+  pred_map_prob=apply(pred_map, 1, function(x) sort(x, decreasing=TRUE)[1])
+  pred_map_prob2=apply(pred_map, 1, function(x) sort(x, decreasing=TRUE)[2])
+  pred_map=colnames(pred_map)[max.col(pred_map, ties.method="first")]
+  pred_map=factor(pred_map, levels=pm_levels)
+  second_highest_map=factor(second_highest_map, levels=pm_levels)
+  
+  #prediction confidence
+  #1 - (pred_map_prob - pred_map_prob2)
+  ci=1-(pred_map_prob-pred_map_prob2)
+  
+  #create rasters
+  pred_map_counts=table(pred_map)
+  second_highest_map_counts=table(second_highest_map)
+  
+  pred_map=data.frame(pred_map, xy)
+  second_highest_map=data.frame(second_highest_map, xy)
+  pred_map_prob=data.frame(pred_map_prob, xy)
+  pred_map_prob2=data.frame(pred_map_prob2, xy)
+  ci=data.frame(ci, xy)
+  
+  coordinates(pred_map)=~x+y
+  coordinates(second_highest_map)=~x+y
+  coordinates(pred_map_prob)=~x+y
+  coordinates(pred_map_prob2)=~x+y
+  coordinates(ci)=~x+y
+  
+  pred_map=rasterFromXYZ(pred_map)
+  second_highest_map=rasterFromXYZ(second_highest_map)
+  pred_map_prob=rasterFromXYZ(pred_map_prob)
+  pred_map_prob2=rasterFromXYZ(pred_map_prob2)
+  ci=rasterFromXYZ(ci)
+  
+  crs(pred_map)=crs(b5)
+  crs(second_highest_map)=crs(b5)
+  crs(pred_map_prob)=crs(b5)
+  crs(pred_map_prob2)=crs(b5)
+  crs(ci)=crs(b5)
+  
+  raster_outputs=stack(pred_map, second_highest_map, pred_map_prob, pred_map_prob2, ci)
+  names(raster_outputs)=c('Most_Likely', "Second_Likely", 'Probability_First', 'Probability_Second', 'Confidence_Interval')
+  
+  #export results
+  writeRaster(raster_outputs, paste('parent_material_map_bare_soil_2021_08_09', i, '.tif', i, sep="_"), format="GTiff", overwrite=TRUE)
+}
