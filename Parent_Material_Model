@@ -119,8 +119,7 @@ for (i in 1:length(w)){
 
 #bare soil model
 #variable selection
-model_pm=ranger(mdep~., data=psm_train, importance='impurity',probability=TRUE, splitrule = "extratrees", case.weights = weights)
-model_pm
+ranger(mdep~., data=psm_train, importance='impurity',probability=TRUE, splitrule = "extratrees", case.weights = weights)model_pm
 sort(importance(model_pm), decreasing=TRUE)
 bare_soil_var_ini=names(sort(importance(model_pm), decreasing=TRUE))
 
